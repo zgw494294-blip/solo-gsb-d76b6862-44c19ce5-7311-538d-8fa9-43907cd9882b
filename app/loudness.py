@@ -45,7 +45,11 @@ class NormalizeResult:
     target_reached: bool
 
 
-def _read_wav(wav_bytes: bytes) -> np.ndarray:
+def _read_wav(
+    wav_bytes: bytes,
+    min_duration_s: float = MIN_DURATION_S,
+    max_duration_s: float = MAX_DURATION_S,
+) -> np.ndarray:
     """Decode a 48 kHz / 16-bit PCM / mono|stereo WAV.
 
     Returns float64 samples in [-1, 1] with shape (n_frames, n_channels).
@@ -71,9 +75,10 @@ def _read_wav(wav_bytes: bytes) -> np.ndarray:
                     f"WAV must be mono or stereo (got {channels} channels)"
                 )
             duration = frames / rate
-            if not MIN_DURATION_S <= duration <= MAX_DURATION_S:
+            if not min_duration_s <= duration <= max_duration_s:
                 raise AudioValidationError(
-                    f"WAV duration must be 1-10 s (got {duration:.3f} s)"
+                    f"WAV duration must be {min_duration_s:g}-"
+                    f"{max_duration_s:g} s (got {duration:.3f} s)"
                 )
             raw = wf.readframes(frames)
     except AudioValidationError:
