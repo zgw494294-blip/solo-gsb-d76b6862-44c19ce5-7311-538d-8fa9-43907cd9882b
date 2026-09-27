@@ -426,6 +426,47 @@ WSOLA 变速不变调：按时长倍率 `1/speed` 改变 WAV 时长而保持原�
 错误：`422` —— Base64 非法、WAV 不合规、`min_relative_flux` 越界或为
 非有限值（NaN/±Inf）。
 
+### `POST /v1/convolution-reverb`
+
+卷积混响：用用户上传的**脉冲响应（IR）**给原音做线性卷积加入混响尾音。
+输出帧数为 `N + M − 1`（原音 N 帧 + 脉冲响应 M 帧 − 1）。原音校验同
+`/v1/normalize`（48 kHz / 16-bit PCM / 单或双声道 / 1–10 s）；脉冲响应为
+48 kHz / 16-bit PCM / 单或双声道 / **1–2 s**，且**不能全静音**。
+
+请求体（JSON）：
+
+| 字段 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| `wav_base64` | string | 必填 | Base64 编码的原音 WAV：48 kHz、16-bit PCM、单/双声道、1–10 s |
+| `ir_wav_base64` | string | 必填 | Base64 编码的脉冲响应 WAV：48 kHz、16-bit PCM、单/双声道、1–2 s，不可全静音 |
+| `wet` | number | 0 ~ 1 | 湿声占比；0 = 仅干声（尾部补零），1 = 仅湿声 |
+
+响应（200）：
+
+| 字段 | 说明 |
+|---|---|
+| `wav_base64` | 混响后的 WAV（`N+M−1` 帧、48 kHz、16-bit PCM），Base64 |
+| `output_frames` | 输出帧数 = 原音帧数 + IR 帧数 − 1 |
+| `post_gain_db` | 量化前对全部声道施加的同一非正后置增益 (dB)；未衰减时为 `0` |
+
+处理规则：
+
+1. 线性卷积由一次 radix-2 FFT 长度（≥ N+M−1 的最小 2 的幂）上的
+   RFFT 逐声道计算，结果取前 `N+M−1` 帧；
+2. 声道路由：**单声道 IR** 作用于原音的每个声道；**双声道 IR 配双声道
+   原音**时左卷左、右卷右；**双声道 IR 配单声道原音**时干声复制到两个
+   输出声道，左右湿声分别由对应 IR 声道与原音卷积得到（保留响应的立体
+   声像）；
+3. 每个输出声道按 `out = (1−wet)×干声补零 + wet×卷积湿声` 混合，干声为
+   原音在 `[0, N)` 上、其余位置补零的 `N+M−1` 帧信号；`wet = 0` 时跳过
+   卷积，输出即逐位不变的原音加全零尾音；
+4. 混合结果超出 16-bit PCM 可表示范围时，对**所有声道的整段信号**施加
+   同一个非正增益（按观测到的最坏码值留 2 LSB 余量回退）后统一量化，
+   **不裁剪（不削波）**；无需衰减时 `post_gain_db = 0`。
+
+错误：`422` —— 任一 Base64 非法、任一 WAV 不合规、IR 时长不在 1～2 s、
+IR 全静音、`wet` 越界或为非有限值（NaN/±Inf）。
+
 ### 处理流程
 
 1. 用 `pyloudnorm`（BS.1770 K 加权）测输入综合响度；
@@ -785,6 +826,45 @@ print(resp["onsets"])
 EOF
 ```
 
+```bash
+# 生成 2 秒 440 Hz 原音与 1.5 秒指数衰减噪声脉冲响应，按 wet=0.4 加混响尾音
+python3 - <<'EOF'
+import base64, io, json, wave, urllib.request
+import numpy as np
+
+rate = 48000
+t = np.arange(rate * 2) / rate
+src = np.round(0.3 * np.sin(2 * np.pi * 440 * t) * 32768).astype("<i2")
+
+rng = np.random.default_rng(0)
+t_ir = np.arange(rate * 3 // 2) / rate
+ir = np.round(0.02 * np.exp(-3 * t_ir) * rng.standard_normal(t_ir.size)
+              * 32768).astype("<i2")
+
+def enc(pcm):
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(rate)
+        wf.writeframes(pcm.tobytes())
+    return base64.b64encode(buf.getvalue()).decode()
+
+req = urllib.request.Request(
+    "http://localhost:8000/v1/convolution-reverb",
+    data=json.dumps({
+        "wav_base64": enc(src),
+        "ir_wav_base64": enc(ir),
+        "wet": 0.4,
+    }).encode(),
+    headers={"Content-Type": "application/json"},
+)
+resp = json.load(urllib.request.urlopen(req))
+print(resp["output_frames"], resp["post_gain_db"])
+# 167999 = 96000 + 72000 - 1（2 s + 1.5 s - 1 帧），0.0（未衰减）
+with open("reverb.wav", "wb") as f:
+    f.write(base64.b64decode(resp["wav_base64"]))
+EOF
+```
+
 ## 项目结构
 
 ```
@@ -800,6 +880,7 @@ app/
   align_stereo.py  # 双声道对齐：校准区间去均值 NCC 偏移估计、右轨平移/反相
   eq.py            # 参量均衡：RBJ peaking biquad 串联、真峰值上限与后置增益回退
   onsets.py        # 谱通量瞬态检测：居中 Hann 窗 STFT、自适应阈值与 80 ms 选点
+  convolution_reverb.py  # 卷积混响：FFT 线性卷积、干湿混合与统一后置增益
 tests/
   test_normalize.py
   test_compare_gain.py
@@ -811,6 +892,7 @@ tests/
   test_align_stereo.py
   test_eq.py
   test_onsets.py
+  test_convolution_reverb.py
 Dockerfile
 docker-compose.yml
 requirements.txt        # 运行依赖（已锁定版本）

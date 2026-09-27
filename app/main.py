@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 from .align_stereo import align_stereo_wav
 from .compare_gain import compare_wav_gain
 from .compress import compress_wav
+from .convolution_reverb import reverb_wav
 from .cut_splice import CueInterval, cut_splice_wav
 from .denoise import denoise_wav
 from .eq import EqBand, eq_wav
@@ -399,6 +400,41 @@ class OnsetsResponse(BaseModel):
     )
 
 
+class ConvolutionReverbRequest(BaseModel):
+    wav_base64: str = Field(
+        ...,
+        min_length=1,
+        description="Base64-encoded WAV: 48 kHz, 16-bit PCM, mono/stereo, 1-10 s",
+    )
+    ir_wav_base64: str = Field(
+        ...,
+        min_length=1,
+        description="Base64-encoded impulse response WAV: 48 kHz, 16-bit PCM, "
+        "mono/stereo, 1-2 s, not all silence",
+    )
+    wet: float = Field(
+        ...,
+        ge=0.0,
+        le=1.0,
+        allow_inf_nan=False,
+        description="Wet/dry mix: 0 = dry only (zero-padded), 1 = wet only",
+    )
+
+
+class ConvolutionReverbResponse(BaseModel):
+    wav_base64: str = Field(
+        ...,
+        description="Reverberant WAV, N+M-1 frames, 48 kHz / 16-bit PCM, Base64"
+    )
+    output_frames: int = Field(
+        ..., description="Output frame count: source frames + IR frames - 1"
+    )
+    post_gain_db: float = Field(
+        ..., description="Uniform non-positive gain applied before quantization "
+        "(dB); 0 when no attenuation was needed"
+    )
+
+
 class EqResponse(BaseModel):
     wav_base64: str = Field(
         ..., description="EQ'd WAV, same frame count and format, Base64"
@@ -680,4 +716,28 @@ def onsets(request: OnsetsRequest) -> OnsetsResponse:
             OnsetModel(frame_index=onset.frame_index, strength=onset.strength)
             for onset in result.onsets
         ]
+    )
+
+
+@app.post("/v1/convolution-reverb", response_model=ConvolutionReverbResponse)
+def convolution_reverb(
+    request: ConvolutionReverbRequest,
+) -> ConvolutionReverbResponse:
+    try:
+        wav_bytes = base64.b64decode(request.wav_base64, validate=True)
+        ir_wav_bytes = base64.b64decode(request.ir_wav_base64, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise HTTPException(
+            status_code=422, detail=f"Invalid Base64 payload: {exc}"
+        ) from exc
+
+    try:
+        result = reverb_wav(wav_bytes, ir_wav_bytes, request.wet)
+    except AudioValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    return ConvolutionReverbResponse(
+        wav_base64=base64.b64encode(result.wav_bytes).decode("ascii"),
+        output_frames=result.output_frames,
+        post_gain_db=round(result.post_gain_db, 3),
     )
